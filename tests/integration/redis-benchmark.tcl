@@ -164,5 +164,43 @@ start_server {tags {"benchmark"}} {
                 }
             }
         }
+
+        # Measure time of trimming
+        # HEADSUP:
+        # - Number of requests is to high to be allowed in regression.
+        # - Remove printouts
+        test {benchmark: xtrim} {
+            r select 0
+            r flushall
+            r config resetstat
+            r config set stream-node-max-entries 100
+
+            # Add elements to stream
+            set cmd [redisbenchmark $master_host $master_port "-n 1000000 -e XADD mystream * FIELD VALUE"]
+            set time_start [clock clicks -milliseconds]
+            if {[catch { exec {*}$cmd } error]} {
+                set first_line [lindex [split $error "\n"] 0]
+                puts [colorstr red "redis-benchmark non zero code. first line: $first_line"]
+                fail "redis-benchmark non zero code. first line: $first_line"
+            }
+            set time_taken [expr [clock clicks -milliseconds] - $time_start]
+            puts "Adding 1000000 elements takes: $time_taken ms"
+
+            assert_match {*calls=1000000,*} [cmdstat xadd]
+            assert_match {1000000} [r XLEN mystream]
+
+            # Perform the XTRIM
+            set tt [time {r XTRIM mystream MAXLEN ~ 10}]
+            puts "Trim takes: $tt"
+            assert_match {*calls=1,*} [cmdstat xtrim]
+            assert_match {100} [r XLEN mystream]
+            # puts [r XINFO STREAM mystream]
+
+            # Trigger trimming by adding to stream
+            set tt [time {r XADD mystream * "field-last" "value-last"}]
+            puts "XADD takes: $tt"
+            puts [r XLEN mystream]
+            puts [r XINFO STREAM mystream]
+        }
     }
 }

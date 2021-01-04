@@ -448,7 +448,137 @@ start_server {
         assert {[r XLEN mystream] == 400}
     }
 
-    
+    # Basic test, probably redudant and can be removed
+    # A lot can be removed, like printouts
+    test {XTRIM simple} {
+        r select 0
+        r flushall
+        r config resetstat
+        r config set stream-node-max-entries 100
+
+        for {set i 0} {$i < 1000} {incr i} {
+            puts [r XADD mystream * "field-$i" "value-$i"]
+            puts [r XINFO STREAM mystream]
+        }
+        assert_match {1000} [r XLEN mystream]
+        puts "> BEFORE TRIM"
+        puts [r XLEN mystream]
+        puts [r XINFO STREAM mystream]
+
+        assert_match {900} [r XTRIM mystream MAXLEN ~ 10]
+        # puts [r XTRIM mystream MAXLEN ~ 10]
+        puts "\n> AFTER TRIM"
+        puts [r XLEN mystream]
+        puts [r XINFO STREAM mystream]
+
+        set tt [time {r XADD mystream * "field-last" "value-last"}]
+        puts "XADD takes: $tt"
+        puts [r XLEN mystream]
+        puts [r XINFO STREAM mystream]
+    }
+
+    # Trim all
+    # A lot can be removed, like printouts
+    test {XTRIM, trim all} {
+        r select 0
+        r flushall
+        r config resetstat
+        r config set stream-node-max-entries 100
+
+        for {set i 0} {$i < 100} {incr i} {
+            puts [r XADD mystream * "field-$i" "value-$i"]
+            puts [r XINFO STREAM mystream]
+        }
+        assert_match {100} [r XLEN mystream]
+        puts "> BEFORE TRIM"
+        puts [r XLEN mystream]
+        puts [r XINFO STREAM mystream]
+
+        assert_match {0} [r XTRIM mystream MAXLEN ~ 10]
+        # puts [r XTRIM mystream MAXLEN ~ 10]
+        puts "\n> AFTER TRIM"
+        puts [r XLEN mystream]
+        puts [r XINFO STREAM mystream]
+
+        assert_match {100} [r XTRIM mystream MAXLEN ~ 0]
+        # puts [r XTRIM mystream MAXLEN ~ 10]
+        puts "\n> AFTER TRIM"
+        puts [r XLEN mystream]
+        puts [r XINFO STREAM mystream]
+
+        set tt [time {r XADD mystream * "field-last" "value-last"}]
+        puts "XADD takes: $tt"
+        puts [r XLEN mystream]
+        puts [r XINFO STREAM mystream]
+    }
+
+    # A lot can be removed, like printouts
+    test {XTRIM, progressive trimming in XADD} {
+        r DEL mystream
+
+        # Append to stream
+        for {set j 0} {$j < 200} {incr j} {
+            r XADD mystream * item $j value val
+        }
+
+        # XLEN before trim
+        assert_equal 200 [r XLEN mystream]
+
+        # XRANGE before trim
+        set items [r XRANGE mystream - +]
+        assert_equal [lindex $items 0 1] {item 0 value val}
+        assert_equal [lindex $items 99 1] {item 99 value val}
+        assert_equal [lindex $items 100 1] {item 100 value val}
+        assert_equal [lindex $items 199 1] {item 199 value val}
+
+        # XREVRANGE before trim
+        set items [r XREVRANGE mystream + -]
+        assert_equal [lindex $items 0 1] {item 199 value val}
+        assert_equal [lindex $items 99 1] {item 100 value val}
+        assert_equal [lindex $items 100 1] {item 99 value val}
+        assert_equal [lindex $items 199 1] {item 0 value val}
+
+        # INFO before trim
+        set info [r XINFO STREAM mystream]
+        assert_equal [lindex $info 2] "radix-tree-keys"
+        assert_equal [lindex $info 3] 2
+        assert_equal [lindex $info 4] "radix-tree-nodes"
+        assert_equal [lindex $info 5] 6
+
+        # XTRIM
+        assert_equal 100 [r XTRIM mystream MAXLEN ~ 100]
+
+        # XLEN after trim
+        assert_equal 100 [r XLEN mystream]
+
+        # XRANGE after trim
+        set items [r XRANGE mystream - +]
+        assert_equal [lindex $items 0 1] {item 100 value val}
+        assert_equal [lindex $items 99 1] {item 199 value val}
+
+        # XREVRANGE after trim
+        set items [r XREVRANGE mystream + -]
+        assert_equal [lindex $items 0 1] {item 199 value val}
+        assert_equal [lindex $items 99 1] {item 100 value val}
+
+        # # INFO before add
+        # set info [r XINFO STREAM mystream]
+        # assert_equal [lindex $info 2] "radix-tree-keys"
+        # assert_equal [lindex $info 3] 2
+        # assert_equal [lindex $info 4] "radix-tree-nodes"
+        # assert_equal [lindex $info 5] 6
+
+        # # XADD
+        # assert_equal 100 [r XADD mystream MAXLEN ~ 100]
+
+        # # INFO after add
+        # puts [r XINFO STREAM mystream]
+        # set info [r XINFO STREAM mystream]
+        # assert_equal [lindex $info 2] "radix-tree-keys"
+        # assert_equal [lindex $info 3] 2
+        # assert_equal [lindex $info 4] "radix-tree-nodes"
+        # assert_equal [lindex $info 5] 6
+    }
 }
 
 start_server {tags {"stream"} overrides {appendonly yes}} {

@@ -56,6 +56,8 @@ stream *streamNew(void) {
     stream *s = zmalloc(sizeof(*s));
     s->rax = raxNew();
     s->length = 0;
+    s->first_id.ms = 0;
+    s->first_id.seq = 0;
     s->last_id.ms = 0;
     s->last_id.seq = 0;
     s->cgroups = NULL; /* Created on demand to save memory when not used. */
@@ -172,6 +174,7 @@ robj *streamDup(robj *o) {
                   new_lp, NULL);
     }
     new_s->length = s->length;
+    new_s->first_id = s->first_id;
     new_s->last_id = s->last_id;
     raxStop(&ri);
 
@@ -523,6 +526,63 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
     s->last_id = id;
     if (added_id) *added_id = id;
     return C_OK;
+}
+
+int64_t streamTrimSetStartId(stream *s, size_t maxlen) {
+    raxIterator ri;
+    raxStart(&ri,s->rax);
+    /* raxSeek(&ri,"^",NULL,0); */
+    unsigned char startkey[sizeof(streamID)];
+    streamEncodeID(startkey,&s->first_id);
+    raxSeek(&ri,">=",startkey,sizeof(startkey));
+
+    int64_t trimmed = 0;
+    while(s->length > maxlen && raxNext(&ri)) {
+        unsigned char *lp = ri.data, *p = lpFirst(lp);
+        int64_t entries = lpGetInteger(p);
+
+        /* Check if we cant trim the whole node */
+        if ((s->length - entries) < maxlen) {
+            break;
+        }
+
+        s->length -= entries;
+        trimmed += entries;
+    }
+    raxStop(&ri);
+
+    if (trimmed > 0) {
+        // Store next key as first id
+        raxSeek(&ri,">",ri.key,ri.key_len);
+        raxNext(&ri);
+        streamDecodeID(ri.key,&s->first_id);
+    }
+
+    return trimmed;
+}
+
+/* Alternative: Seek for start if and iterate-delete with raxPrev() */
+/* but we probably want to remove a limited amount of items from start */
+void streamTrimUntilFirstId(stream *s) {
+    if (s->first_id.ms == 0 && s->first_id.seq == 0) return;
+
+    raxIterator ri;
+    raxStart(&ri,s->rax);
+    raxSeek(&ri,"^",NULL,0);
+
+    unsigned char first[sizeof(streamID)];
+    streamEncodeID(first,&s->first_id);
+
+    while(raxNext(&ri)) {
+
+        /* We are done if this is the first id */
+        if (memcmp(first,ri.key,sizeof(streamID)) == 0) break;
+
+        // Remove key and its data
+        lpFree(ri.data);
+        raxRemove(s->rax,ri.key,ri.key_len,NULL);
+        raxSeek(&ri,">=",ri.key,ri.key_len);
+    }
 }
 
 /* Trim the stream 's' to have no more than maxlen elements, and return the
@@ -1475,6 +1535,9 @@ void xaddCommand(client *c) {
     notifyKeyspaceEvent(NOTIFY_STREAM,"xadd",c->argv[1],c->db->id);
     server.dirty++;
 
+    // Initial trim, this should be done within streamTrimByLength()
+    streamTrimUntilFirstId(s);
+
     if (maxlen >= 0) {
         /* Notify xtrim event if needed. */
         if (streamTrimByLength(s,maxlen,approx_maxlen)) {
@@ -1550,7 +1613,13 @@ void xrangeGenericCommand(client *c, int rev) {
         addReplyNullArray(c);
     } else {
         if (count == -1) count = 0;
-        streamReplyWithRange(c,s,&startid,&endid,count,rev,NULL,NULL,0,NULL);
+
+        if (streamCompareID(&startid, &s->first_id) < 0) {
+            streamReplyWithRange(c,s,&s->first_id,&endid,count,rev,NULL,NULL,0,NULL);
+        } else {
+            streamReplyWithRange(c,s,&startid,&endid,count,rev,NULL,NULL,0,NULL);
+        }
+
     }
 }
 
@@ -2765,7 +2834,11 @@ void xtrimCommand(client *c) {
     /* Perform the trimming. */
     int64_t deleted = 0;
     if (trim_strategy == TRIM_STRATEGY_MAXLEN) {
-        deleted = streamTrimByLength(s,maxlen,approx_maxlen);
+        if (approx_maxlen) {
+            deleted = streamTrimSetStartId(s,maxlen);
+        } else {
+            deleted = streamTrimByLength(s,maxlen,approx_maxlen);
+        }
     } else {
         addReplyError(c,"XTRIM called without an option to trim the stream");
         return;
@@ -2824,6 +2897,9 @@ void xinfoReplyWithStreamInfo(client *c, stream *s) {
     addReplyLongLong(c,raxSize(s->rax));
     addReplyBulkCString(c,"radix-tree-nodes");
     addReplyLongLong(c,s->rax->numnodes);
+    /* // Add first_id in show command? affects some tests */
+    /* addReplyBulkCString(c,"first-id"); */
+    /* addReplyStreamID(c,&s->first_id); */
     addReplyBulkCString(c,"last-generated-id");
     addReplyStreamID(c,&s->last_id);
 
