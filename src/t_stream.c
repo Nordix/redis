@@ -528,10 +528,108 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
     return C_OK;
 }
 
-int64_t streamTrimSetStartId(stream *s, size_t maxlen) {
+void streamTrimUntilFirstId(stream *s) {
+    if (s->first_id.ms == 0 && s->first_id.seq == 0) return;
+
     raxIterator ri;
     raxStart(&ri,s->rax);
-    /* raxSeek(&ri,"^",NULL,0); */
+    raxSeek(&ri,"^",NULL,0);
+
+    while(raxNext(&ri)) {
+
+        streamID master_id;
+        streamDecodeID(ri.key,&master_id);
+
+        if (streamCompareID(&master_id,&s->first_id) < 0) {
+            if (raxPrev(&ri)) {
+                // Remove previous node, if exists
+                lpFree(ri.data);
+                raxRemove(s->rax,ri.key,ri.key_len,NULL);
+                raxSeek(&ri,">=",ri.key,ri.key_len);
+            }
+            continue;
+        }
+
+        // First id is within previous rax
+        if (raxPrev(&ri)) {
+            unsigned char *lp = ri.data, *p = lpFirst(lp);
+            int64_t deleted = 0;
+
+            /* Update current id*/
+            streamDecodeID(ri.key,&master_id);
+
+            /* Skip all the master fields. */
+            int64_t master_fields_count = lpGetInteger(p);
+            p = lpNext(lp,p); /* Seek the first field. */
+            for (int64_t j = 0; j < master_fields_count; j++)
+                p = lpNext(lp,p); /* Skip all master fields. */
+            p = lpNext(lp,p); /* Skip the zero master entry terminator. */
+
+            /* 'p' is now pointing to the first entry inside the listpack.
+             * We have to run entry after entry, marking entries as deleted
+             * if they are already not deleted. */
+            while(p) {
+                int to_skip;
+                int flags = lpGetInteger(p);
+
+                if (!(flags & STREAM_ITEM_FLAG_DELETED)) {
+                    streamID id = master_id;
+                    p = lpNext(lp,p); /* ID ms delta. */
+                    id.ms += lpGetInteger(p);
+                    p = lpNext(lp,p); /* ID seq delta. */
+                    id.seq += lpGetInteger(p);
+
+                    if (streamCompareID(&master_id,&s->first_id) >= 0) {
+                        /* first id found */
+                        break;
+                    }
+
+                    /* Not yet found the first id, set delete flag */
+                    flags |= STREAM_ITEM_FLAG_DELETED;
+                    p = lpPrev(lp,p); p = lpPrev(lp,p);
+                    lp = lpReplaceInteger(lp,&p,flags);
+                    deleted++;
+                }
+
+                p = lpNext(lp,p); /* Skip ID ms delta. */
+                p = lpNext(lp,p); /* Skip ID seq delta. */
+                p = lpNext(lp,p); /* Seek num-fields or values (if compressed). */
+                if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
+                    to_skip = master_fields_count;
+                } else {
+                    to_skip = lpGetInteger(p);
+                    to_skip = 1+(to_skip*2);
+                }
+
+                while(to_skip--) p = lpNext(lp,p); /* Skip the whole entry. */
+                p = lpNext(lp,p); /* Skip the final lp-count field. */
+            }
+
+            /* Found the first id, update counter unless it was first found */
+            if (deleted > 0) {
+                p = lpFirst(lp);
+                int64_t entries = lpGetInteger(p);
+                lp = lpReplaceInteger(lp,&p,entries-deleted);
+                p = lpNext(lp,p); /* Seek deleted field. */
+                int64_t marked_deleted = lpGetInteger(p);
+                lp = lpReplaceInteger(lp,&p,marked_deleted+deleted);
+
+                /* Insert back into the tree in order to update the listpack pointer. */
+                raxInsert(s->rax,ri.key,ri.key_len,lp,NULL);
+            }
+        }
+        break;
+    }
+}
+
+/* Set new first id and length */
+/* return number of trimmed elements */
+int64_t streamSetFirstIdByLength(stream *s, size_t maxlen, int approx) {
+    if (s->length <= maxlen) return 0;
+
+    raxIterator ri;
+    raxStart(&ri,s->rax);
+
     unsigned char startkey[sizeof(streamID)];
     streamEncodeID(startkey,&s->first_id);
     raxSeek(&ri,">=",startkey,sizeof(startkey));
@@ -541,48 +639,73 @@ int64_t streamTrimSetStartId(stream *s, size_t maxlen) {
         unsigned char *lp = ri.data, *p = lpFirst(lp);
         int64_t entries = lpGetInteger(p);
 
-        /* Check if we cant trim the whole node */
-        if ((s->length - entries) < maxlen) {
+        if (s->length - entries >= maxlen) {
+            s->length -= entries;
+            trimmed += entries;
+            continue;
+        }
+
+        /* Get the master id needed for the relative info in listpack */
+        streamID master_id;
+        streamDecodeID(ri.key,&master_id);
+
+        if (approx) {
+            // Store key as first id
+            s->first_id = master_id;
             break;
         }
 
-        s->length -= entries;
-        trimmed += entries;
+        /* Otherwise, we have to check single entries inside the listpack.*/
+        p = lpNext(lp,p); /* Seek deleted field. */
+        p = lpNext(lp,p); /* Seek num-of-fields in the master entry. */
+
+        /* Skip all the master fields. */
+        int64_t master_fields_count = lpGetInteger(p);
+        p = lpNext(lp,p); /* Seek the first field. */
+        for (int64_t j = 0; j < master_fields_count; j++)
+            p = lpNext(lp,p); /* Skip all master fields. */
+        p = lpNext(lp,p); /* Skip the zero master entry terminator. */
+
+        /* 'p' is now pointing to the first entry inside the listpack.
+         * We have to run entry after entry, marking entries as deleted
+         * if they are already not deleted. */
+        while(p) {
+            int flags = lpGetInteger(p);
+            int to_skip;
+
+            if (!(flags & STREAM_ITEM_FLAG_DELETED)) {
+                if (s->length <= maxlen) {
+                    streamID id = master_id;
+                    p = lpNext(lp,p); /* ID ms delta. */
+                    id.ms += lpGetInteger(p);
+                    p = lpNext(lp,p); /* ID seq delta. */
+                    id.seq += lpGetInteger(p);
+
+                    s->first_id.ms = id.ms;
+                    s->first_id.seq = id.seq;
+                    break;
+                }
+                s->length--;
+                trimmed++;
+            }
+
+            p = lpNext(lp,p); /* Skip ms */
+            p = lpNext(lp,p); /* Skip seq */
+            p = lpNext(lp,p); /* Seek num-fields or values (if compressed). */
+            if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
+                to_skip = master_fields_count;
+            } else {
+                to_skip = lpGetInteger(p);
+                to_skip = 1+(to_skip*2);
+            }
+
+            while(to_skip--) p = lpNext(lp,p); /* Skip the whole entry. */
+            p = lpNext(lp,p); /* Skip the final lp-count field. */
+        }
     }
+
     raxStop(&ri);
-
-    if (trimmed > 0) {
-        // Store next key as first id
-        raxSeek(&ri,">",ri.key,ri.key_len);
-        raxNext(&ri);
-        streamDecodeID(ri.key,&s->first_id);
-    }
-
     return trimmed;
-}
-
-/* Alternative: Seek for start if and iterate-delete with raxPrev() */
-/* but we probably want to remove a limited amount of items from start */
-void streamTrimUntilFirstId(stream *s) {
-    if (s->first_id.ms == 0 && s->first_id.seq == 0) return;
-
-    raxIterator ri;
-    raxStart(&ri,s->rax);
-    raxSeek(&ri,"^",NULL,0);
-
-    unsigned char first[sizeof(streamID)];
-    streamEncodeID(first,&s->first_id);
-
-    while(raxNext(&ri)) {
-
-        /* We are done if this is the first id */
-        if (memcmp(first,ri.key,sizeof(streamID)) == 0) break;
-
-        // Remove key and its data
-        lpFree(ri.data);
-        raxRemove(s->rax,ri.key,ri.key_len,NULL);
-        raxSeek(&ri,">=",ri.key,ri.key_len);
-    }
 }
 
 /* Trim the stream 's' to have no more than maxlen elements, and return the
@@ -1535,12 +1658,13 @@ void xaddCommand(client *c) {
     notifyKeyspaceEvent(NOTIFY_STREAM,"xadd",c->argv[1],c->db->id);
     server.dirty++;
 
-    // Initial trim, this should be done within streamTrimByLength()
+    // Async trim
     streamTrimUntilFirstId(s);
 
     if (maxlen >= 0) {
         /* Notify xtrim event if needed. */
-        if (streamTrimByLength(s,maxlen,approx_maxlen)) {
+        /* if (streamTrimByLength(s,maxlen,approx_maxlen)) { */
+        if (streamSetFirstIdByLength(s,maxlen,approx_maxlen)) {
             notifyKeyspaceEvent(NOTIFY_STREAM,"xtrim",c->argv[1],c->db->id);
         }
         if (approx_maxlen) streamRewriteApproxMaxlen(c,s,maxlen_arg_idx);
@@ -2834,11 +2958,8 @@ void xtrimCommand(client *c) {
     /* Perform the trimming. */
     int64_t deleted = 0;
     if (trim_strategy == TRIM_STRATEGY_MAXLEN) {
-        if (approx_maxlen) {
-            deleted = streamTrimSetStartId(s,maxlen);
-        } else {
-            deleted = streamTrimByLength(s,maxlen,approx_maxlen);
-        }
+        /* deleted = streamTrimByLength(s,maxlen,approx_maxlen); */
+        deleted = streamSetFirstIdByLength(s,maxlen,approx_maxlen);
     } else {
         addReplyError(c,"XTRIM called without an option to trim the stream");
         return;
