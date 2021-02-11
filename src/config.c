@@ -516,26 +516,6 @@ void loadServerConfigFromString(char *config) {
                 err = "Invalid master port"; goto loaderr;
             }
             server.repl_state = REPL_STATE_CONNECT;
-        } else if (!strcasecmp(argv[0],"requirepass") && argc == 2) {
-            if (sdslen(argv[1]) > CONFIG_AUTHPASS_MAX_LEN) {
-                err = "Password is longer than CONFIG_AUTHPASS_MAX_LEN";
-                goto loaderr;
-            }
-            /* The old "requirepass" directive just translates to setting
-             * a password to the default user. The only thing we do
-             * additionally is to remember the cleartext password in this
-             * case, for backward compatibility with Redis <= 5. */
-            ACLSetUser(DefaultUser,"resetpass",-1);
-            sdsfree(server.requirepass);
-            server.requirepass = NULL;
-            if (sdslen(argv[1])) {
-                sds aclop = sdscatlen(sdsnew(">"), argv[1], sdslen(argv[1]));
-                ACLSetUser(DefaultUser,aclop,sdslen(aclop));
-                sdsfree(aclop);
-                server.requirepass = sdsdup(argv[1]);
-            } else {
-                ACLSetUser(DefaultUser,"nopass",-1);
-            }
         } else if (!strcasecmp(argv[0],"list-max-ziplist-entries") && argc == 2){
             /* DEAD OPTION */
         } else if (!strcasecmp(argv[0],"list-max-ziplist-value") && argc == 2) {
@@ -746,24 +726,7 @@ void configSetCommand(client *c) {
     if (0) { /* this starts the config_set macros else-if chain. */
 
     /* Special fields that can't be handled with general macros. */
-    config_set_special_field("requirepass") {
-        if (sdslen(o->ptr) > CONFIG_AUTHPASS_MAX_LEN) goto badfmt;
-        /* The old "requirepass" directive just translates to setting
-         * a password to the default user. The only thing we do
-         * additionally is to remember the cleartext password in this
-         * case, for backward compatibility with Redis <= 5. */
-        ACLSetUser(DefaultUser,"resetpass",-1);
-        sdsfree(server.requirepass);
-        server.requirepass = NULL;
-        if (sdslen(o->ptr)) {
-            sds aclop = sdscatlen(sdsnew(">"), o->ptr, sdslen(o->ptr));
-            ACLSetUser(DefaultUser,aclop,sdslen(aclop));
-            sdsfree(aclop);
-            server.requirepass = sdsdup(o->ptr);
-        } else {
-            ACLSetUser(DefaultUser,"nopass",-1);
-        }
-    } config_set_special_field("save") {
+    config_set_special_field("save") {
         int vlen, j;
         sds *v = sdssplitlen(o->ptr,sdslen(o->ptr)," ",1,&vlen);
 
@@ -1040,16 +1003,6 @@ void configGetCommand(client *c) {
         addReplyBulkCString(c,"bind");
         addReplyBulkCString(c,aux);
         sdsfree(aux);
-        matches++;
-    }
-    if (stringmatch(pattern,"requirepass",1)) {
-        addReplyBulkCString(c,"requirepass");
-        sds password = server.requirepass;
-        if (password) {
-            addReplyBulkCBuffer(c,password,sdslen(password));
-        } else {
-            addReplyBulkCString(c,"");
-        }
         matches++;
     }
 
@@ -1561,7 +1514,8 @@ void rewriteConfigBindOption(struct rewriteConfigState *state) {
 }
 
 /* Rewrite the requirepass option. */
-void rewriteConfigRequirepassOption(struct rewriteConfigState *state, char *option) {
+static void rewriteConfigRequirepassOption(typeData data, const char *name, struct rewriteConfigState *state) {
+    UNUSED(data);
     int force = 1;
     sds line;
     sds password = server.requirepass;
@@ -1569,15 +1523,15 @@ void rewriteConfigRequirepassOption(struct rewriteConfigState *state, char *opti
     /* If there is no password set, we don't want the requirepass option
      * to be present in the configuration at all. */
     if (password == NULL) {
-        rewriteConfigMarkAsProcessed(state,option);
+        rewriteConfigMarkAsProcessed(state,name);
         return;
     }
 
-    line = sdsnew(option);
+    line = sdsnew(name);
     line = sdscatlen(line, " ", 1);
     line = sdscatsds(line, password);
 
-    rewriteConfigRewriteLine(state,option,line,force);
+    rewriteConfigRewriteLine(state,name,line,force);
 }
 
 /* Glue together the configuration lines in the current configuration
@@ -1736,7 +1690,6 @@ int rewriteConfig(char *path, int force_all) {
     rewriteConfigUserOption(state);
     rewriteConfigDirOption(state);
     rewriteConfigSlaveofOption(state,"replicaof");
-    rewriteConfigRequirepassOption(state,"requirepass");
     rewriteConfigBytesOption(state,"client-query-buffer-limit",server.client_max_querybuf_len,PROTO_MAX_QUERYBUF_LEN);
     rewriteConfigStringOption(state,"cluster-config-file",server.cluster_configfile,CONFIG_DEFAULT_CLUSTER_CONFIG_FILE);
     rewriteConfigNotifykeyspaceeventsOption(state);
@@ -2416,6 +2369,44 @@ static int updateTlsCfgInt(long long val, long long prev, const char **err) {
 }
 #endif  /* USE_OPENSSL */
 
+static int setConfigRequirepassOption(typeData data, sds *argv, int argc, int update, const char **err) {
+    UNUSED(data);
+    if (argc != 1) {
+        *err = "wrong number of arguments";
+        return 0;
+    }
+    if (sdslen(argv[0]) > CONFIG_AUTHPASS_MAX_LEN) {
+        if (!update) *err = "Password is longer than CONFIG_AUTHPASS_MAX_LEN";
+        return 0;
+    }
+    /* The old "requirepass" directive just translates to setting
+     * a password to the default user. The only thing we do
+     * additionally is to remember the cleartext password in this
+     * case, for backward compatibility with Redis <= 5. */
+    ACLSetUser(DefaultUser,"resetpass",-1);
+    sdsfree(server.requirepass);
+    server.requirepass = NULL;
+    if (sdslen(argv[0])) {
+        sds aclop = sdscatlen(sdsnew(">"), argv[0], sdslen(argv[0]));
+        ACLSetUser(DefaultUser,aclop,sdslen(aclop));
+        sdsfree(aclop);
+        server.requirepass = sdsdup(argv[0]);
+    } else {
+        ACLSetUser(DefaultUser,"nopass",-1);
+    }
+    return 1;
+}
+
+static void getConfigRequirepassOption(client *c, typeData data) {
+    UNUSED(data);
+    sds password = server.requirepass;
+    if (password) {
+        addReplyBulkCBuffer(c,password,sdslen(password));
+    } else {
+        addReplyBulkCString(c,"");
+    }
+}
+
 standardConfig configs[] = {
     /* Bool configs */
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
@@ -2580,6 +2571,9 @@ standardConfig configs[] = {
     createStringConfig("tls-ciphers", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphers, NULL, NULL, updateTlsCfg),
     createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, updateTlsCfg),
 #endif
+
+    /* Special configs */
+    createSpecialConfig("requirepass", NULL, MODIFIABLE_CONFIG, setConfigRequirepassOption, getConfigRequirepassOption, rewriteConfigRequirepassOption),
 
     /* NULL Terminator */
     {NULL}
