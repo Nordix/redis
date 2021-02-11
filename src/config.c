@@ -250,6 +250,25 @@ typedef struct standardConfig {
 
 standardConfig configs[];
 
+typedef struct typeSpecialInterface {
+    /* Called on server startup and CONFIG SET, returns 1 on success, 0 on error
+     * and can set a verbose err string, update is true when called from CONFIG SET */
+    int (*set)(sds *argv, int argc, int update, const char **err);
+    /* Called on CONFIG GET, required to add output to the client */
+    void (*get)(client *c);
+    /* Called on CONFIG REWRITE, required to rewrite the config state */
+    void (*rewrite)(const char *name, struct rewriteConfigState *state);
+} typeSpecialInterface;
+
+typedef struct specialConfig {
+    const char *name; /* The user visible name of this config */
+    const char *alias; /* An alias that can also be used for this config */
+    const int modifiable; /* Can this value be updated by CONFIG SET? */
+    typeSpecialInterface interface; /* The function pointers that define the type interface */
+} specialConfig;
+
+specialConfig special_configs[];
+
 /*-----------------------------------------------------------------------------
  * Enum access functions
  *----------------------------------------------------------------------------*/
@@ -428,6 +447,26 @@ void loadServerConfigFromString(char *config) {
                     goto loaderr;
                 }
                 if (!config->interface.set(config->data, argv[1], 0, &err)) {
+                    goto loaderr;
+                }
+
+                match = 1;
+                break;
+            }
+        }
+
+        if (match) {
+            sdsfreesplitres(argv,argc);
+            continue;
+        }
+
+        /* Iterate the configs that are special */
+        for (specialConfig *config = special_configs; config->name != NULL; config++) {
+            if ((!strcasecmp(argv[0],config->name) ||
+                (config->alias && !strcasecmp(argv[0],config->alias))))
+            {
+                /* Set config using all arguments that follows */
+                if (!config->interface.set(&argv[1], argc-1, 0, &err)) {
                     goto loaderr;
                 }
 
@@ -747,6 +786,20 @@ void configSetCommand(client *c) {
         }
     }
 
+    /* Iterate the configs that are special */
+    for (specialConfig *config = special_configs; config->name != NULL; config++) {
+        if(config->modifiable && (!strcasecmp(c->argv[2]->ptr,config->name) ||
+            (config->alias && !strcasecmp(c->argv[2]->ptr,config->alias))))
+        {
+            /* Set config using the always single argument in CONFIG SET */
+            if (!config->interface.set((char**)&o->ptr /*argv*/, 1 /*argc*/, 1, &errstr)) {
+                goto badfmt;
+            }
+            addReply(c,shared.ok);
+            return;
+        }
+    }
+
     if (0) { /* this starts the config_set macros else-if chain. */
 
     /* Special fields that can't be handled with general macros. */
@@ -951,6 +1004,19 @@ void configGetCommand(client *c) {
         if (config->alias && stringmatch(pattern,config->alias,1)) {
             addReplyBulkCString(c,config->alias);
             config->interface.get(c,config->data);
+            matches++;
+        }
+    }
+    /* Iterate the configs that are special */
+    for (specialConfig *config = special_configs; config->name != NULL; config++) {
+        if (stringmatch(pattern,config->name,1)) {
+            addReplyBulkCString(c,config->name);
+            config->interface.get(c);
+            matches++;
+        }
+        if (config->alias && stringmatch(pattern,config->alias,1)) {
+            addReplyBulkCString(c,config->alias);
+            config->interface.get(c);
             matches++;
         }
     }
@@ -1732,6 +1798,10 @@ int rewriteConfig(char *path, int force_all) {
     for (standardConfig *config = configs; config->name != NULL; config++) {
         config->interface.rewrite(config->data, config->name, state);
     }
+    /* Iterate the configs that are special */
+    for (specialConfig *config = special_configs; config->name != NULL; config++) {
+        config->interface.rewrite(config->name, state);
+    }
 
     rewriteConfigBindOption(state);
     rewriteConfigOctalOption(state,"unixsocketperm",server.unixsocketperm,CONFIG_DEFAULT_UNIX_SOCKET_PERM);
@@ -1781,6 +1851,12 @@ static char loadbuf[LOADBUF_SIZE];
 
 #define embedConfigInterface(initfn, setfn, getfn, rewritefn) .interface = { \
     .init = (initfn), \
+    .set = (setfn), \
+    .get = (getfn), \
+    .rewrite = (rewritefn) \
+},
+
+#define embedSpecialConfigInterface(setfn, getfn, rewritefn) .interface = { \
     .set = (setfn), \
     .get = (getfn), \
     .rewrite = (rewritefn) \
@@ -2560,6 +2636,17 @@ standardConfig configs[] = {
     createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, updateTlsCfg),
 #endif
 
+    /* NULL Terminator */
+    {NULL}
+};
+
+/* Special Configs */
+#define createSpecialConfig(name, alias, modifiable, setfn, getfn, rewritefn) { \
+    embedCommonConfig(name, alias, modifiable) \
+    embedSpecialConfigInterface(setfn, getfn, rewritefn) \
+}
+
+specialConfig special_configs[] = {
     /* NULL Terminator */
     {NULL}
 };
