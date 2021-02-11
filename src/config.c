@@ -714,13 +714,6 @@ void loadServerConfig(char *filename, char config_from_stdin, char *options) {
         if (yn == -1) goto badfmt; \
         _var = yn;
 
-#define config_set_numerical_field(_name,_var,min,max) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name)) { \
-        if (getLongLongFromObject(o,&ll) == C_ERR) goto badfmt; \
-        if (min != LLONG_MIN && ll < min) goto badfmt; \
-        if (max != LLONG_MAX && ll > max) goto badfmt; \
-        _var = ll;
-
 #define config_set_special_field(_name) \
     } else if (!strcasecmp(c->argv[2]->ptr,_name)) {
 
@@ -732,7 +725,6 @@ void loadServerConfig(char *filename, char config_from_stdin, char *options) {
 
 void configSetCommand(client *c) {
     robj *o;
-    long long ll;
     int err;
     const char *errstr = NULL;
     serverAssertWithInfo(c,c->argv[2],sdsEncodedObject(c->argv[2]));
@@ -865,14 +857,6 @@ void configSetCommand(client *c) {
 
         if (flags == -1) goto badfmt;
         server.notify_keyspace_events = flags;
-    /* Numerical fields.
-     * config_set_numerical_field(name,var,min,max) */
-    } config_set_numerical_field(
-      "watchdog-period",ll,0,INT_MAX) {
-        if (ll)
-            enableWatchdog(ll);
-        else
-            disableWatchdog();
     /* Everything else is an error... */
     } config_set_else {
         addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
@@ -917,20 +901,10 @@ badfmt: /* Bad format errors */
     } \
 } while(0)
 
-#define config_get_numerical_field(_name,_var) do { \
-    if (stringmatch(pattern,_name,1)) { \
-        ll2string(buf,sizeof(buf),_var); \
-        addReplyBulkCString(c,_name); \
-        addReplyBulkCString(c,buf); \
-        matches++; \
-    } \
-} while(0)
-
 void configGetCommand(client *c) {
     robj *o = c->argv[2];
     void *replylen = addReplyDeferredLen(c);
     char *pattern = o->ptr;
-    char buf[128];
     int matches = 0;
     serverAssertWithInfo(c,o,sdsEncodedObject(o));
 
@@ -963,9 +937,6 @@ void configGetCommand(client *c) {
 
     /* String values */
     config_get_string_field("logfile",server.logfile);
-
-    /* Numerical values */
-    config_get_numerical_field("watchdog-period",server.watchdog_period);
 
     /* Everything we can't handle with macros follows. */
 
@@ -1724,7 +1695,7 @@ int rewriteConfig(char *path, int force_all) {
     }
     /* Iterate the configs that are special */
     for (specialConfig *config = special_configs; config->name != NULL; config++) {
-        config->interface.rewrite(config->name, state);
+        if (config->interface.rewrite) config->interface.rewrite(config->name, state);
     }
 
     rewriteConfigBindOption(state);
@@ -2475,6 +2446,28 @@ static void getConfigClientQueryBufferLimitOption(client *c) {
     addReplyBulkCString(c,buf);
 }
 
+static int setConfigWatchdogPeriodOption(sds *argv, int argc, int update, const char **err) {
+    UNUSED(argc);
+    UNUSED(err);
+    if (!update) return 0;
+
+    long long ll;
+    if (string2ll(argv[0],sdslen(argv[0]),&ll) == 0) return 0;
+    if (ll < 0 || ll > INT_MAX) return 0;
+
+    if (ll)
+        enableWatchdog(ll);
+    else
+        disableWatchdog();
+    return 1;
+}
+
+static void getConfigWatchdogPeriodOption(client *c) {
+    char buf[128];
+    ll2string(buf,sizeof(buf),server.watchdog_period);
+    addReplyBulkCString(c,buf);
+}
+
 standardConfig configs[] = {
     /* Bool configs */
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
@@ -2654,6 +2647,7 @@ specialConfig special_configs[] = {
     createSpecialConfig("requirepass", NULL, MODIFIABLE_CONFIG, setConfigRequirepassOption, getConfigRequirepassOption, rewriteConfigRequirepassOption),
     createSpecialConfig("dir", NULL, MODIFIABLE_CONFIG, setConfigDirOption, getConfigDirOption, rewriteConfigDirOption),
     createSpecialConfig("client-query-buffer-limit", NULL, MODIFIABLE_CONFIG, setConfigClientQueryBufferLimitOption, getConfigClientQueryBufferLimitOption, rewriteConfigClientQueryBufferLimitOption),
+    createSpecialConfig("watchdog-period", NULL, MODIFIABLE_CONFIG, setConfigWatchdogPeriodOption, getConfigWatchdogPeriodOption, NULL),
 
     /* NULL Terminator */
     {NULL}
