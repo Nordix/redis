@@ -493,8 +493,6 @@ void loadServerConfigFromString(char *config) {
             }
         } else if (!strcasecmp(argv[0],"include") && argc == 2) {
             loadServerConfig(argv[1], 0, NULL);
-        } else if ((!strcasecmp(argv[0],"client-query-buffer-limit")) && argc == 2) {
-             server.client_max_querybuf_len = memtoll(argv[1],NULL);
         } else if ((!strcasecmp(argv[0],"slaveof") ||
                     !strcasecmp(argv[0],"replicaof")) && argc == 3) {
             slaveof_linenum = linenum;
@@ -679,12 +677,6 @@ void loadServerConfig(char *filename, char config_from_stdin, char *options) {
         if (max != LLONG_MAX && ll > max) goto badfmt; \
         _var = ll;
 
-#define config_set_memory_field(_name,_var) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name)) { \
-        ll = memtoll(o->ptr,&err); \
-        if (err || ll < 0) goto badfmt; \
-        _var = ll;
-
 #define config_set_special_field(_name) \
     } else if (!strcasecmp(c->argv[2]->ptr,_name)) {
 
@@ -824,10 +816,6 @@ void configSetCommand(client *c) {
             enableWatchdog(ll);
         else
             disableWatchdog();
-    /* Memory fields.
-     * config_set_memory_field(name,var) */
-    } config_set_memory_field(
-      "client-query-buffer-limit",server.client_max_querybuf_len) {
     /* Everything else is an error... */
     } config_set_else {
         addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
@@ -907,7 +895,6 @@ void configGetCommand(client *c) {
     config_get_string_field("logfile",server.logfile);
 
     /* Numerical values */
-    config_get_numerical_field("client-query-buffer-limit",server.client_max_querybuf_len);
     config_get_numerical_field("watchdog-period",server.watchdog_period);
 
     /* Everything we can't handle with macros follows. */
@@ -1542,6 +1529,12 @@ void rewriteConfigReleaseState(struct rewriteConfigState *state) {
     zfree(state);
 }
 
+/* Rewrite the option client-query-buffer-limit */
+void rewriteConfigClientQueryBufferLimitOption(typeData data, const char *name, struct rewriteConfigState *state) {
+    UNUSED(data);
+    rewriteConfigBytesOption(state,name,server.client_max_querybuf_len,PROTO_MAX_QUERYBUF_LEN);
+}
+
 /* At the end of the rewrite process the state contains the remaining
  * map between "option name" => "lines in the original config file".
  * Lines used by the rewrite process were removed by the function
@@ -1669,7 +1662,6 @@ int rewriteConfig(char *path, int force_all) {
     rewriteConfigSaveOption(state);
     rewriteConfigUserOption(state);
     rewriteConfigSlaveofOption(state,"replicaof");
-    rewriteConfigBytesOption(state,"client-query-buffer-limit",server.client_max_querybuf_len,PROTO_MAX_QUERYBUF_LEN);
     rewriteConfigStringOption(state,"cluster-config-file",server.cluster_configfile,CONFIG_DEFAULT_CLUSTER_CONFIG_FILE);
     rewriteConfigNotifykeyspaceeventsOption(state);
     rewriteConfigClientoutputbufferlimitOption(state);
@@ -2415,6 +2407,28 @@ static void getConfigDirOption(client *c, typeData data) {
     addReplyBulkCString(c,buf);
 }
 
+static int setConfigClientQueryBufferLimitOption(typeData data, sds *argv, int argc, int update, const char **err) {
+    UNUSED(data);
+    if (argc != 1) {
+        *err = "wrong number of arguments";
+        return 0;
+    }
+    int failed;
+    long long ll = memtoll(argv[0],&failed);
+    if (update && (failed || ll < 0))
+        return 0;
+
+    server.client_max_querybuf_len = ll;
+    return 1;
+}
+
+static void getConfigClientQueryBufferLimitOption(client *c, typeData data) {
+    UNUSED(data);
+    char buf[128];
+    ll2string(buf,sizeof(buf),server.client_max_querybuf_len);
+    addReplyBulkCString(c,buf);
+}
+
 standardConfig configs[] = {
     /* Bool configs */
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
@@ -2583,6 +2597,7 @@ standardConfig configs[] = {
     /* Special configs */
     createSpecialConfig("requirepass", NULL, MODIFIABLE_CONFIG, setConfigRequirepassOption, getConfigRequirepassOption, rewriteConfigRequirepassOption),
     createSpecialConfig("dir", NULL, MODIFIABLE_CONFIG, setConfigDirOption, getConfigDirOption, rewriteConfigDirOption),
+    createSpecialConfig("client-query-buffer-limit", NULL, MODIFIABLE_CONFIG, setConfigClientQueryBufferLimitOption, getConfigClientQueryBufferLimitOption, rewriteConfigClientQueryBufferLimitOption),
 
     /* NULL Terminator */
     {NULL}
