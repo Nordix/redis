@@ -229,11 +229,9 @@ typedef union typeData {
 typedef struct typeInterface {
     /* Called on server start, to init the server with default value */
     void (*init)(typeData data);
-    /* Called on server start, should return 1 on success, 0 on error and should set err */
-    int (*load)(typeData data, sds *argc, int argv, const char **err);
     /* Called on server startup and CONFIG SET, returns 1 on success, 0 on error
      * and can set a verbose err string, update is true when called from CONFIG SET */
-    int (*set)(typeData data, sds value, int update, const char **err);
+    int (*set)(typeData data, sds *argv, int argc, int update, const char **err);
     /* Called on CONFIG GET, required to add output to the client */
     void (*get)(client *c, typeData data);
     /* Called on CONFIG REWRITE, required to rewrite the config state */
@@ -380,7 +378,7 @@ static int updateOOMScoreAdjValues(sds *args, const char **err, int apply) {
 
 void initConfigValues() {
     for (standardConfig *config = configs; config->name != NULL; config++) {
-        config->interface.init(config->data);
+        if (config->interface.init) config->interface.init(config->data);
     }
 }
 
@@ -423,11 +421,8 @@ void loadServerConfigFromString(char *config) {
             if ((!strcasecmp(argv[0],config->name) ||
                 (config->alias && !strcasecmp(argv[0],config->alias))))
             {
-                if (argc != 2) {
-                    err = "wrong number of arguments";
-                    goto loaderr;
-                }
-                if (!config->interface.set(config->data, argv[1], 0, &err)) {
+                /* Set config using all arguments that follows */
+                if (!config->interface.set(config->data, &argv[1], argc-1, 0, &err)) {
                     goto loaderr;
                 }
 
@@ -739,7 +734,8 @@ void configSetCommand(client *c) {
         if(config->modifiable && (!strcasecmp(c->argv[2]->ptr,config->name) ||
             (config->alias && !strcasecmp(c->argv[2]->ptr,config->alias))))
         {
-            if (!config->interface.set(config->data,o->ptr,1,&errstr)) {
+            /* Set config using the always single argument in CONFIG SET */
+            if (!config->interface.set(config->data,(char**)&o->ptr /*argv*/, 1 /*argc*/, 1, &errstr)) {
                 goto badfmt;
             }
             addReply(c,shared.ok);
@@ -1803,8 +1799,12 @@ static void boolConfigInit(typeData data) {
     *data.yesno.config = data.yesno.default_value;
 }
 
-static int boolConfigSet(typeData data, sds value, int update, const char **err) {
-    int yn = yesnotoi(value);
+static int boolConfigSet(typeData data, sds *argv, int argc, int update, const char **err) {
+    if (argc != 1) {
+        *err = "wrong number of arguments";
+        return 0;
+    }
+    int yn = yesnotoi(argv[0]);
     if (yn == -1) {
         *err = "argument must be 'yes' or 'no'";
         return 0;
@@ -1844,11 +1844,15 @@ static void stringConfigInit(typeData data) {
     *data.string.config = (data.string.convert_empty_to_null && !data.string.default_value) ? NULL : zstrdup(data.string.default_value);
 }
 
-static int stringConfigSet(typeData data, sds value, int update, const char **err) {
-    if (data.string.is_valid_fn && !data.string.is_valid_fn(value, err))
+static int stringConfigSet(typeData data, sds *argv, int argc, int update, const char **err) {
+    if (argc != 1) {
+        *err = "wrong number of arguments";
+        return 0;
+    }
+    if (data.string.is_valid_fn && !data.string.is_valid_fn(argv[0], err))
         return 0;
     char *prev = *data.string.config;
-    *data.string.config = (data.string.convert_empty_to_null && !value[0]) ? NULL : zstrdup(value);
+    *data.string.config = (data.string.convert_empty_to_null && !argv[0][0]) ? NULL : zstrdup(argv[0]);
     if (update && data.string.update_fn && !data.string.update_fn(*data.string.config, prev, err)) {
         zfree(*data.string.config);
         *data.string.config = prev;
@@ -1871,11 +1875,15 @@ static void sdsConfigInit(typeData data) {
     *data.sds.config = (data.sds.convert_empty_to_null && !data.sds.default_value) ? NULL: sdsnew(data.sds.default_value);
 }
 
-static int sdsConfigSet(typeData data, sds value, int update, const char **err) {
-    if (data.sds.is_valid_fn && !data.sds.is_valid_fn(value, err))
+static int sdsConfigSet(typeData data, sds *argv, int argc, int update, const char **err) {
+    if (argc != 1) {
+        *err = "wrong number of arguments";
+        return 0;
+    }
+    if (data.sds.is_valid_fn && !data.sds.is_valid_fn(argv[0], err))
         return 0;
     sds prev = *data.sds.config;
-    *data.sds.config = (data.sds.convert_empty_to_null && (sdslen(value) == 0)) ? NULL : sdsdup(value);
+    *data.sds.config = (data.sds.convert_empty_to_null && (sdslen(argv[0]) == 0)) ? NULL : sdsdup(argv[0]);
     if (update && data.sds.update_fn && !data.sds.update_fn(*data.sds.config, prev, err)) {
         sdsfree(*data.sds.config);
         *data.sds.config = prev;
@@ -1930,8 +1938,12 @@ static void enumConfigInit(typeData data) {
     *data.enumd.config = data.enumd.default_value;
 }
 
-static int enumConfigSet(typeData data, sds value, int update, const char **err) {
-    int enumval = configEnumGetValue(data.enumd.enum_value, value);
+static int enumConfigSet(typeData data, sds *argv, int argc, int update, const char **err) {
+    if (argc != 1) {
+        *err = "wrong number of arguments";
+        return 0;
+    }
+    int enumval = configEnumGetValue(data.enumd.enum_value, argv[0]);
     if (enumval == INT_MIN) {
         sds enumerr = sdsnew("argument must be one of the following: ");
         configEnum *enumNode = data.enumd.enum_value;
@@ -2066,17 +2078,21 @@ static int numericBoundaryCheck(typeData data, long long ll, const char **err) {
     return 1;
 }
 
-static int numericConfigSet(typeData data, sds value, int update, const char **err) {
+static int numericConfigSet(typeData data, sds *argv, int argc, int update, const char **err) {
+    if (argc != 1) {
+        *err = "wrong number of arguments";
+        return 0;
+    }
     long long ll, prev = 0;
     if (data.numeric.is_memory) {
         int memerr;
-        ll = memtoll(value, &memerr);
+        ll = memtoll(argv[0], &memerr);
         if (memerr || ll < 0) {
             *err = "argument must be a memory value";
             return 0;
         }
     } else {
-        if (!string2ll(value, sdslen(value),&ll)) {
+        if (!string2ll(argv[0], sdslen(argv[0]),&ll)) {
             *err = "argument couldn't be parsed into an integer" ;
             return 0;
         }
@@ -2202,6 +2218,11 @@ static void numericConfigRewrite(typeData data, const char *name, struct rewrite
         .numeric_type = NUMERIC_TYPE_OFF_T, \
         .config.ot = &(config_addr) \
     } \
+}
+
+#define createSpecialConfig(name, alias, modifiable, setfn, getfn, rewritefn) { \
+    embedCommonConfig(name, alias, modifiable) \
+    embedConfigInterface(NULL, setfn, getfn, rewritefn) \
 }
 
 static int isValidActiveDefrag(int val, const char **err) {
