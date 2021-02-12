@@ -563,14 +563,6 @@ void loadServerConfigFromString(char *config) {
         } else if (!strcasecmp(argv[0],"cluster-config-file") && argc == 2) {
             zfree(server.cluster_configfile);
             server.cluster_configfile = zstrdup(argv[1]);
-        } else if (!strcasecmp(argv[0],"notify-keyspace-events") && argc == 2) {
-            int flags = keyspaceEventsStringToFlags(argv[1]);
-
-            if (flags == -1) {
-                err = "Invalid event class character. Use 'g$lshzxeA'.";
-                goto loaderr;
-            }
-            server.notify_keyspace_events = flags;
         } else if (!strcasecmp(argv[0],"user") && argc >= 2) {
             int argc_err;
             if (ACLAppendUserForLoading(argv,argc,&argc_err) == C_ERR) {
@@ -663,22 +655,6 @@ void loadServerConfig(char *filename, char config_from_stdin, char *options) {
 /*-----------------------------------------------------------------------------
  * CONFIG SET implementation
  *----------------------------------------------------------------------------*/
-
-#define config_set_bool_field(_name,_var) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name)) { \
-        int yn = yesnotoi(o->ptr); \
-        if (yn == -1) goto badfmt; \
-        _var = yn;
-
-#define config_set_special_field(_name) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name)) {
-
-#define config_set_special_field_with_alias(_name1,_name2) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name1) || \
-               !strcasecmp(c->argv[2]->ptr,_name2)) {
-
-#define config_set_else } else
-
 void configSetCommand(client *c) {
     robj *o;
     const char *errstr = NULL;
@@ -713,23 +689,8 @@ void configSetCommand(client *c) {
         }
     }
 
-    if (0) { /* this starts the config_set macros else-if chain. */
-
-    /* Special fields that can't be handled with general macros. */
-    config_set_special_field("notify-keyspace-events") {
-        int flags = keyspaceEventsStringToFlags(o->ptr);
-
-        if (flags == -1) goto badfmt;
-        server.notify_keyspace_events = flags;
-    /* Everything else is an error... */
-    } config_set_else {
-        addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
-            (char*)c->argv[2]->ptr);
-        return;
-    }
-
-    /* On success we just return a generic OK for all the options. */
-    addReply(c,shared.ok);
+    addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
+                        (char*)c->argv[2]->ptr);
     return;
 
 badfmt: /* Bad format errors */
@@ -753,14 +714,6 @@ badfmt: /* Bad format errors */
     if (stringmatch(pattern,_name,1)) { \
         addReplyBulkCString(c,_name); \
         addReplyBulkCString(c,_var ? _var : ""); \
-        matches++; \
-    } \
-} while(0)
-
-#define config_get_bool_field(_name,_var) do { \
-    if (stringmatch(pattern,_name,1)) { \
-        addReplyBulkCString(c,_name); \
-        addReplyBulkCString(c,_var ? "yes" : "no"); \
         matches++; \
     } \
 } while(0)
@@ -825,13 +778,6 @@ void configGetCommand(client *c) {
         else
             buf[0] = '\0';
         addReplyBulkCString(c,buf);
-        matches++;
-    }
-    if (stringmatch(pattern,"notify-keyspace-events",1)) {
-        sds flags = keyspaceEventsFlagsToString(server.notify_keyspace_events);
-
-        addReplyBulkCString(c,"notify-keyspace-events");
-        addReplyBulkSds(c,flags);
         matches++;
     }
     if (stringmatch(pattern,"bind",1)) {
@@ -1250,17 +1196,16 @@ void rewriteConfigSlaveofOption(struct rewriteConfigState *state, char *option) 
 }
 
 /* Rewrite the notify-keyspace-events option. */
-void rewriteConfigNotifykeyspaceeventsOption(struct rewriteConfigState *state) {
+void rewriteConfigNotifyKeyspaceEventsOption(const char *name, struct rewriteConfigState *state) {
     int force = server.notify_keyspace_events != 0;
-    char *option = "notify-keyspace-events";
     sds line, flags;
 
     flags = keyspaceEventsFlagsToString(server.notify_keyspace_events);
-    line = sdsnew(option);
+    line = sdsnew(name);
     line = sdscatlen(line, " ", 1);
     line = sdscatrepr(line, flags, sdslen(flags));
     sdsfree(flags);
-    rewriteConfigRewriteLine(state,option,line,force);
+    rewriteConfigRewriteLine(state,name,line,force);
 }
 
 /* Rewrite the client-output-buffer-limit option. */
@@ -1516,7 +1461,6 @@ int rewriteConfig(char *path, int force_all) {
     rewriteConfigUserOption(state);
     rewriteConfigSlaveofOption(state,"replicaof");
     rewriteConfigStringOption(state,"cluster-config-file",server.cluster_configfile,CONFIG_DEFAULT_CLUSTER_CONFIG_FILE);
-    rewriteConfigNotifykeyspaceeventsOption(state);
 
     /* Rewrite Sentinel config if in Sentinel mode. */
     if (server.sentinel_mode) rewriteConfigSentinelOption(state);
@@ -2506,6 +2450,25 @@ static void getConfigOOMScoreAdjValuesOption(client *c) {
     sdsfree(buf);
 }
 
+static int setConfigNotifyKeyspaceEventsOption(sds *argv, int argc, int update, const char **err) {
+    if (argc != 1) {
+        *err = "wrong number of arguments";
+        return 0;
+    }
+    int flags = keyspaceEventsStringToFlags(argv[0]);
+    if (flags == -1) {
+        if (update) *err = "Invalid event class character. Use 'g$lshzxeA'.";
+        return 0;
+    }
+    server.notify_keyspace_events = flags;
+    return 1;
+}
+
+static void getConfigNotifyKeyspaceEventsOption(client *c) {
+    sds flags = keyspaceEventsFlagsToString(server.notify_keyspace_events);
+    addReplyBulkSds(c,flags);
+}
+
 standardConfig configs[] = {
     /* Bool configs */
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
@@ -2689,6 +2652,7 @@ specialConfig special_configs[] = {
     createSpecialConfig("save", NULL, MODIFIABLE_CONFIG, setConfigSaveOption, getConfigSaveOption, rewriteConfigSaveOption),
     createSpecialConfig("client-output-buffer-limit", NULL, MODIFIABLE_CONFIG, setConfigClientOutputBufferLimitOption, getConfigClientOutputBufferLimitOption, rewriteConfigClientOutputBufferLimitOption),
     createSpecialConfig("oom-score-adj-values", NULL, MODIFIABLE_CONFIG, setConfigOOMScoreAdjValuesOption, getConfigOOMScoreAdjValuesOption, rewriteConfigOOMScoreAdjValuesOption),
+    createSpecialConfig("notify-keyspace-events", NULL, MODIFIABLE_CONFIG, setConfigNotifyKeyspaceEventsOption, getConfigNotifyKeyspaceEventsOption, rewriteConfigNotifyKeyspaceEventsOption),
 
     /* NULL Terminator */
     {NULL}
