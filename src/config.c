@@ -563,8 +563,6 @@ void loadServerConfigFromString(char *config) {
         } else if (!strcasecmp(argv[0],"cluster-config-file") && argc == 2) {
             zfree(server.cluster_configfile);
             server.cluster_configfile = zstrdup(argv[1]);
-        } else if (!strcasecmp(argv[0],"oom-score-adj-values") && argc == 1 + CONFIG_OOM_COUNT) {
-            if (updateOOMScoreAdjValues(&argv[1], &err, 0) == C_ERR) goto loaderr;
         } else if (!strcasecmp(argv[0],"notify-keyspace-events") && argc == 2) {
             int flags = keyspaceEventsStringToFlags(argv[1]);
 
@@ -718,18 +716,7 @@ void configSetCommand(client *c) {
     if (0) { /* this starts the config_set macros else-if chain. */
 
     /* Special fields that can't be handled with general macros. */
-    config_set_special_field("oom-score-adj-values") {
-        int vlen;
-        int success = 1;
-
-        sds *v = sdssplitlen(o->ptr, sdslen(o->ptr), " ", 1, &vlen);
-        if (vlen != CONFIG_OOM_COUNT || updateOOMScoreAdjValues(v, &errstr, 1) == C_ERR)
-            success = 0;
-
-        sdsfreesplitres(v, vlen);
-        if (!success)
-            goto badfmt;
-    } config_set_special_field("notify-keyspace-events") {
+    config_set_special_field("notify-keyspace-events") {
         int flags = keyspaceEventsStringToFlags(o->ptr);
 
         if (flags == -1) goto badfmt;
@@ -853,22 +840,6 @@ void configGetCommand(client *c) {
         addReplyBulkCString(c,"bind");
         addReplyBulkCString(c,aux);
         sdsfree(aux);
-        matches++;
-    }
-
-    if (stringmatch(pattern,"oom-score-adj-values",0)) {
-        sds buf = sdsempty();
-        int j;
-
-        for (j = 0; j < CONFIG_OOM_COUNT; j++) {
-            buf = sdscatprintf(buf,"%d", server.oom_score_adj_values[j]);
-            if (j != CONFIG_OOM_COUNT-1)
-                buf = sdscatlen(buf," ",1);
-        }
-
-        addReplyBulkCString(c,"oom-score-adj-values");
-        addReplyBulkCString(c,buf);
-        sdsfree(buf);
         matches++;
     }
 
@@ -1321,13 +1292,12 @@ void rewriteConfigClientOutputBufferLimitOption(const char *name, struct rewrite
 }
 
 /* Rewrite the oom-score-adj-values option. */
-void rewriteConfigOOMScoreAdjValuesOption(struct rewriteConfigState *state) {
+void rewriteConfigOOMScoreAdjValuesOption(const char *name, struct rewriteConfigState *state) {
     int force = 0;
     int j;
-    char *option = "oom-score-adj-values";
     sds line;
 
-    line = sdsnew(option);
+    line = sdsnew(name);
     line = sdscatlen(line, " ", 1);
     for (j = 0; j < CONFIG_OOM_COUNT; j++) {
         if (server.oom_score_adj_values[j] != configOOMScoreAdjValuesDefaults[j])
@@ -1337,7 +1307,7 @@ void rewriteConfigOOMScoreAdjValuesOption(struct rewriteConfigState *state) {
         if (j+1 != CONFIG_OOM_COUNT)
             line = sdscatlen(line, " ", 1);
     }
-    rewriteConfigRewriteLine(state,option,line,force);
+    rewriteConfigRewriteLine(state,name,line,force);
 }
 
 /* Rewrite the bind option. */
@@ -1547,7 +1517,6 @@ int rewriteConfig(char *path, int force_all) {
     rewriteConfigSlaveofOption(state,"replicaof");
     rewriteConfigStringOption(state,"cluster-config-file",server.cluster_configfile,CONFIG_DEFAULT_CLUSTER_CONFIG_FILE);
     rewriteConfigNotifykeyspaceeventsOption(state);
-    rewriteConfigOOMScoreAdjValuesOption(state);
 
     /* Rewrite Sentinel config if in Sentinel mode. */
     if (server.sentinel_mode) rewriteConfigSentinelOption(state);
@@ -2502,6 +2471,41 @@ static void getConfigClientOutputBufferLimitOption(client *c) {
     sdsfree(buf);
 }
 
+static int setConfigOOMScoreAdjValuesOption(sds *argv, int argc, int update, const char **err) {
+    if (update) {
+        int vlen;
+        int success = 1;
+
+        sds *v = sdssplitlen(argv[0], sdslen(argv[0]), " ", 1, &vlen);
+        if (vlen != CONFIG_OOM_COUNT || updateOOMScoreAdjValues(v,err,1) == C_ERR)
+            success = 0;
+
+        sdsfreesplitres(v, vlen);
+        return success;
+    }
+
+    if (argc != CONFIG_OOM_COUNT) {
+        *err = "wrong number of arguments";
+        return 0;
+    }
+    if (updateOOMScoreAdjValues(&argv[0],err,0) == C_ERR) return 0;
+    return 1;
+}
+
+static void getConfigOOMScoreAdjValuesOption(client *c) {
+    sds buf = sdsempty();
+    int j;
+
+    for (j = 0; j < CONFIG_OOM_COUNT; j++) {
+        buf = sdscatprintf(buf,"%d", server.oom_score_adj_values[j]);
+        if (j != CONFIG_OOM_COUNT-1)
+            buf = sdscatlen(buf," ",1);
+    }
+
+    addReplyBulkCString(c,buf);
+    sdsfree(buf);
+}
+
 standardConfig configs[] = {
     /* Bool configs */
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
@@ -2684,6 +2688,7 @@ specialConfig special_configs[] = {
     createSpecialConfig("watchdog-period", NULL, MODIFIABLE_CONFIG, setConfigWatchdogPeriodOption, getConfigWatchdogPeriodOption, NULL),
     createSpecialConfig("save", NULL, MODIFIABLE_CONFIG, setConfigSaveOption, getConfigSaveOption, rewriteConfigSaveOption),
     createSpecialConfig("client-output-buffer-limit", NULL, MODIFIABLE_CONFIG, setConfigClientOutputBufferLimitOption, getConfigClientOutputBufferLimitOption, rewriteConfigClientOutputBufferLimitOption),
+    createSpecialConfig("oom-score-adj-values", NULL, MODIFIABLE_CONFIG, setConfigOOMScoreAdjValuesOption, getConfigOOMScoreAdjValuesOption, rewriteConfigOOMScoreAdjValuesOption),
 
     /* NULL Terminator */
     {NULL}
